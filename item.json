@@ -1,0 +1,14 @@
+﻿{
+  "$schema": "https://gitlab.com/vtolvr-mods/ModLoader/-/raw/release/schema.json",
+  "Title": "Realistic HUD",
+  "Description": "Adds real-jet style digital readouts (Mach, radar altitude, steerpoint bearing/range/TTG, master mode) to the VTOL VR HUD.",
+  "PreviewImageUrl": "https://vtolvr-mods.com/static/img/Logo.png",
+  "Tags": [],
+  "PublishFieldId": 0,
+  "MetaData": {
+    "DllName": "RealisticHUD.dll",
+    "AllowLoadOnStart": true,
+    "ShowOnMainList": true,
+    "DllHash": ""
+  }
+}
