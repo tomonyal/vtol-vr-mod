@@ -54,6 +54,9 @@ public class RealisticHudOverlay : MonoBehaviour
     // Serves as the always-on replacement for the attitude arc that stock VTOL VR only shows
     // on the HMCS visor.
     private const float RollArcRadius = 145f;
+    // Reference HUDs show the pointer sitting clearly outside/below the tick arc (ticks read as
+    // the "sky" side, pointer below them), not inside it.
+    private const float RollPointerRadius = 165f;
     private Transform rollScaleRoot;
     private RectTransform rollPointer;
 
@@ -148,6 +151,11 @@ public class RealisticHudOverlay : MonoBehaviour
     private HUDGunDirectorSight gunSight;
     private Text aspectText;
 
+    // Pipper's ring/9G-dash/maneuver-line cluster - only meaningful with an actual lead solution,
+    // so hidden until gunSight.isTargetLocked (see UpdateGunLock).
+    private Transform pipperLockGroup;
+    private bool pipperLockGroupShown = true;
+
     // Stock missile DLZ scale (Rmax/Rmin/no-escape ladder next to the locked target, drawn by
     // HUDDynamicLaunchZone): scaled up and shifted down since it renders quite small and high
     // on the HUD by default.
@@ -170,10 +178,25 @@ public class RealisticHudOverlay : MonoBehaviour
     private Image[] radarLockIconImages;
     private bool radarLockIconHidden;
 
+    // Stock "noseIndicator" (StaticHUDParent/noseIndicator, sprite hud_noseIndicator) - the
+    // actual source of the persistent "W" mark, confirmed via a live sprite-name dump. Lives
+    // outside HUDGunDirectorSight entirely (a static, always-on nose reference), which is why
+    // none of the gunsight-specific fixes above ever reached it. Something stock re-enables it
+    // on a target lock transition, racing our 0.15s coroutine tick - forced off in LateUpdate
+    // (every frame) instead, see gunModeCached.
+    private Image noseIndicatorImage;
+    private bool gunModeCached;
+
     // Always-on boresight "gun cross" - reference HUDs show this fixed nose-reference symbol
     // regardless of selected weapon, not just while the gun is armed (unlike
     // HUDGunDirectorSight.fixedSightTransform, which only exists/updates in gun mode).
     private Transform boresightCross;
+
+    // Waypoint diamond marker - independent of HUDWaypoint's own icon transform, which lives at
+    // a Z depth far beyond hudDepth (see RestyleWaypointIndicator/CreateWaypointTadpole) and
+    // collapsed an icon built on it down to a barely-visible dot.
+    private Transform waypointTadpole;
+    private GameObject stockWaypointIcon;
 
     // Great circle steering cue: small ring offset from the boresight cross showing which way
     // to turn/climb to get established on course to the current steerpoint. Reference footage
@@ -231,6 +254,13 @@ public class RealisticHudOverlay : MonoBehaviour
         if (hudUi != null && hudUi.staticHudParent != null)
         {
             hudUi.staticHudParent.localScale *= StaticHudShrink;
+
+            // "noseIndicator" (sprite hud_noseIndicator) - a static, always-on nose/waterline
+            // reference mark parented outside HUDGunDirectorSight entirely, which is why none of
+            // the gunsight-specific disabling above ever touched it. Confirmed live via a sprite
+            // name dump (positioned dead center, just above the pipper) to be the persistent "W"
+            // mark that kept surviving every other fix.
+            noseIndicatorImage = hudUi.staticHudParent.Find("noseIndicator")?.GetComponent<Image>();
         }
 
         masterModeText = CreateText("RH_MasterMode", new Vector2(0f, 230f), TextAnchor.UpperCenter, sizeBoost: 2);
@@ -271,23 +301,33 @@ public class RealisticHudOverlay : MonoBehaviour
             return;
         }
 
-        // pipperTransform is the computed lead/aim point. Per the EEGS reference: a small "+"
-        // (predicted/level-5 pipper), a tiny "o" 1G reticle hanging just below it, a short "-"
-        // 9G reticle further below that, and the maneuver-potential horizontal lines crossing
-        // through the pipper. No dashed ring here - it sat at the same radius as the cross
-        // (overlapping it) and only ever read as a bunched, star-like clump rather than a
-        // separate BATR ring; the reference doesn't show one at the pipper either.
+        // pipperTransform is the computed lead/aim point. Per the EEGS reference: a tiny "o" 1G
+        // reticle, a short "-" 9G reticle further below that, and the maneuver-potential
+        // horizontal lines crossing through the pipper. pipperTransform's own active state is
+        // driven by stock funnel/gimbal/lock logic we don't control (and shouldn't fight, since
+        // the funnel wedge itself is wanted) - when it IS active it's the real moving lead-
+        // computed aim point (can be off-boresight), so it needs its own cross; boresightCross
+        // (below) is hidden whenever pipperTransform is actually showing, to avoid duplicating.
         if (gds.pipperTransform != null)
         {
-            Image stockPipperImg = gds.pipperTransform.GetComponent<Image>();
-            if (stockPipperImg != null)
+            // Recurse into children, not just the transform's own Image: the stock reticle art
+            // is a compound sprite, split across child GameObjects - disabling only the direct
+            // Image left the rest rendering behind.
+            foreach (Image img in gds.pipperTransform.GetComponentsInChildren<Image>(true))
             {
-                stockPipperImg.enabled = false;
+                img.enabled = false;
             }
             BuildCross(gds.pipperTransform, 6f, 1.5f);
-            BuildSolidRing(gds.pipperTransform, 4f, 8, new Vector2(0f, -26f));
-            BuildNineGDash(gds.pipperTransform);
-            BuildManeuverPotentialLines(gds.pipperTransform);
+
+            // The 1G ring/9G dash/maneuver lines only mean anything once there's an actual lead
+            // solution being computed against a locked target - grouped under one child so they
+            // can be shown/hidden together based on gds.isTargetLocked (see UpdateGunLock).
+            GameObject lockGroupGo = new GameObject("RH_PipperLockGroup");
+            lockGroupGo.transform.SetParent(gds.pipperTransform, worldPositionStays: false);
+            pipperLockGroup = lockGroupGo.transform;
+            BuildSolidRing(pipperLockGroup, 4f, 8, new Vector2(0f, -26f));
+            BuildNineGDash(pipperLockGroup);
+            BuildManeuverPotentialLines(pipperLockGroup);
         }
 
         // fixedSightTransform: per the decompiled HUDGunDirectorSight.LateUpdate, this gets its
@@ -299,10 +339,9 @@ public class RealisticHudOverlay : MonoBehaviour
         // "boresight" mark - keep decorating it.
         if (gds.fixedSightTransform != null)
         {
-            Image stockFixedImg = gds.fixedSightTransform.GetComponent<Image>();
-            if (stockFixedImg != null)
+            foreach (Image img in gds.fixedSightTransform.GetComponentsInChildren<Image>(true))
             {
-                stockFixedImg.enabled = false;
+                img.enabled = false;
             }
             BuildCross(gds.fixedSightTransform, 8f, 1.5f);
         }
@@ -350,6 +389,17 @@ public class RealisticHudOverlay : MonoBehaviour
         if (gds.rangeImage != null)
         {
             gds.rangeImage.enabled = false;
+        }
+
+        // gunFunnel.displayObj carries a stock "bore" cross sprite that duplicates our own
+        // pipper cross at the same spot - disable its Image without touching the funnel's
+        // UILineRenderer3D wedge walls (that wedge is wanted functionality, left alone).
+        if (gds.gunFunnel != null && gds.gunFunnel.displayObj != null)
+        {
+            foreach (Image img in gds.gunFunnel.displayObj.GetComponentsInChildren<Image>(true))
+            {
+                img.enabled = false;
+            }
         }
 
         // The stock lead line (drawn from the boresight cross to the pipper) doesn't exist on
@@ -733,14 +783,15 @@ public class RealisticHudOverlay : MonoBehaviour
             BuildRollTick(root.transform, angle, major ? 14f : 9f, RollArcRadius);
         }
 
-        // Pointer: a caret ("^") just inside the tick arc, rotated to the current bank.
+        // Pointer: a caret ("^"), clearly separated below the tick arc, rotated to the current
+        // bank.
         GameObject ptr = new GameObject("RH_RollPointer");
         ptr.transform.SetParent(root.transform, worldPositionStays: false);
         rollPointer = ptr.AddComponent<RectTransform>();
         rollPointer.localScale = Vector3.one;
         BuildAspectBar(ptr.transform, 0f, 10f, 30f);
         BuildAspectBar(ptr.transform, 0f, 10f, -30f);
-        SetPointerAngle(rollPointer, 0f, RollArcRadius - 14f);
+        SetPointerAngle(rollPointer, 0f, RollPointerRadius);
     }
 
     // Segments are built once at a fixed thickness and repositioned/rescaled every tick in
@@ -880,7 +931,7 @@ public class RealisticHudOverlay : MonoBehaviour
 
     private void SetRollPointerAngle(float bankDeg)
     {
-        SetPointerAngle(rollPointer, bankDeg, RollArcRadius - 14f);
+        SetPointerAngle(rollPointer, bankDeg, RollPointerRadius);
     }
 
     private static void SetPointerAngle(RectTransform pointer, float bankDeg, float radius)
@@ -900,7 +951,7 @@ public class RealisticHudOverlay : MonoBehaviour
         GameObject go = new GameObject("RH_BoresightCross");
         go.transform.SetParent(hudTransform, worldPositionStays: false);
         boresightCross = go.transform;
-        BuildCross(boresightCross, 8f, 1.5f);
+        BuildCross(boresightCross, 6f, 1.5f);
     }
 
     // Great circle steering cue: small ring that offsets sideways from the boresight cross,
@@ -1019,28 +1070,33 @@ public class RealisticHudOverlay : MonoBehaviour
 
         if (wpt.waypointIcon != null)
         {
-            foreach (Image img in wpt.waypointIcon.GetComponentsInChildren<Image>(true))
-            {
-                img.enabled = false;
-            }
-            BuildTadpole(wpt.waypointIcon, 8f, 14f);
+            // Leave the stock icon hidden entirely rather than building on it: it lives at
+            // HUDWaypoint's own far Z depth (startDepth + tunnelCount*depthInterval, thousands
+            // of units vs. this mod's hudDepth of ~1000), which collapsed a tadpole built there
+            // down to a barely-visible dot instead of a readable ring+leg. CreateWaypointTadpole
+            // (below) builds an independent copy at the standard hudDepth instead, ray-cast
+            // toward the real waypoint bearing every frame like boresightCross/FPM.
+            // HUDWaypoint.EnableTunnel() re-activates this GameObject on every new-waypoint
+            // transition, so it's also forced off every frame in LateUpdate below.
+            stockWaypointIcon = wpt.waypointIcon.gameObject;
+            stockWaypointIcon.SetActive(false);
         }
+
+        CreateWaypointTadpole();
     }
 
-    // Real-jet steerpoint symbol: a small ring ("o") with a short leg dropping from it ("io"),
-    // rather than the stock chain of diamond gates.
-    private void BuildTadpole(Transform parent, float ringRadius, float legLength)
+    // Independent of HUDWaypoint's own icon hierarchy (see RestyleWaypointIndicator) so it can
+    // be positioned at hudDepth instead of HUDWaypoint's own far-away depth. A hollow diamond
+    // (4 equally-spaced BuildSolidRing segments - 4 points on a circle connected by chords is
+    // exactly a square, giving a clean diamond outline with no separate leg/tail to be confused
+    // with the steering cue's own ring+stub shape).
+    private void CreateWaypointTadpole()
     {
-        BuildSolidRing(parent, ringRadius, 10, Vector2.zero);
-
-        GameObject leg = new GameObject("RH_TadpoleLeg");
-        leg.transform.SetParent(parent, worldPositionStays: false);
-        Image legImg = AddImage(leg);
-        RectTransform legRt = legImg.rectTransform;
-        legRt.localScale = Vector3.one;
-        legRt.sizeDelta = new Vector2(2f, legLength);
-        legRt.pivot = new Vector2(0.5f, 1f);
-        legRt.anchoredPosition = new Vector2(0f, -ringRadius);
+        GameObject go = new GameObject("RH_WaypointTadpole");
+        go.transform.SetParent(hudTransform, worldPositionStays: false);
+        waypointTadpole = go.transform;
+        BuildSolidRing(waypointTadpole, 10f, 4, Vector2.zero);
+        waypointTadpole.gameObject.SetActive(false);
     }
 
     private Text CreateText(string name, Vector2 anchoredPos, TextAnchor anchor, int sizeBoost = 0)
@@ -1089,6 +1145,36 @@ public class RealisticHudOverlay : MonoBehaviour
             boresightCross.position = ray.GetPoint(hudDepth);
             boresightCross.rotation = Quaternion.LookRotation(ray.direction, hudTransform.up);
         }
+
+        if (waypointTadpole != null)
+        {
+            WaypointManager wm = WaypointManager.instance;
+            Vector3? wptPos = wm != null ? wm.currentWaypointPos : null;
+            if (wptPos != null)
+            {
+                Ray ray = new Ray(VRHead.position, wptPos.Value - VRHead.position);
+                waypointTadpole.position = ray.GetPoint(hudDepth);
+                waypointTadpole.rotation = Quaternion.LookRotation(ray.direction, hudTransform.up);
+                waypointTadpole.gameObject.SetActive(true);
+            }
+            else
+            {
+                waypointTadpole.gameObject.SetActive(false);
+            }
+        }
+
+        if (stockWaypointIcon != null)
+        {
+            stockWaypointIcon.SetActive(false);
+        }
+
+        // Forced every frame (not just the 0.15s coroutine tick) - something stock re-enables
+        // this on a target lock transition, and only a same-frame LateUpdate reliably wins that
+        // race rather than flashing on for up to 150ms.
+        if (noseIndicatorImage != null)
+        {
+            noseIndicatorImage.enabled = !gunModeCached;
+        }
     }
 
     private IEnumerator UpdateRoutine()
@@ -1111,9 +1197,11 @@ public class RealisticHudOverlay : MonoBehaviour
             }
 
             bool gunMode = IsGunMode();
+            gunModeCached = gunMode;
 
             UpdateMasterMode();
             UpdateDeclutter(gunMode);
+            UpdateGunLock(gunMode);
             UpdateDataBlock(gunMode);
             UpdateFlightData(gunMode);
             if (!gunMode)
@@ -1138,6 +1226,24 @@ public class RealisticHudOverlay : MonoBehaviour
         return weaponManager != null
             && weaponManager.currentEquip != null
             && weaponManager.currentEquip.weaponType == HPEquippable.WeaponTypes.Gun;
+    }
+
+    // Shows the pipper's ring/9G-dash/maneuver-line cluster only while an actual lead solution
+    // is being computed (gunSight.isTargetLocked) - meaningless clutter otherwise, since without
+    // a locked target there's no lead to depict.
+    private void UpdateGunLock(bool gunMode)
+    {
+        if (pipperLockGroup == null)
+        {
+            return;
+        }
+
+        bool shouldShow = gunMode && gunSight != null && gunSight.isTargetLocked;
+        if (shouldShow != pipperLockGroupShown)
+        {
+            pipperLockGroup.gameObject.SetActive(shouldShow);
+            pipperLockGroupShown = shouldShow;
+        }
     }
 
     // Real HUDs decrease the amount of readout in a gun/dogfight fight to keep the reticle area
@@ -1176,6 +1282,15 @@ public class RealisticHudOverlay : MonoBehaviour
             }
             radarLockIconHidden = gunMode;
         }
+
+        // Hide whenever the stock pipper reticle is itself actually on screen (its own cross
+        // then marks the real, possibly off-boresight, lead-computed aim point) - checking
+        // pipperTransform's actual active state directly covers every reason it can turn on
+        // (lock, gimbal-active, etc.), not just the "locked" case. Otherwise (funnel wedge
+        // showing, pipper off) this stays up as the one reliable fixed reticle mark.
+        bool pipperShowing = gunSight != null && gunSight.pipperTransform != null
+            && gunSight.pipperTransform.gameObject.activeInHierarchy;
+        boresightCross?.gameObject.SetActive(!(gunMode && pipperShowing));
 
         if (hudDeclutter == null)
         {
